@@ -37,10 +37,12 @@ public function main() returns error? {
 ```
 
 `chatStream` gives the raw chunks instead: each `ai:ChatCompletionChunk` carries text, reasoning
-and tool-call fragments, and the last one carries the finish reason and the token usage. Tool-call
-fragments are correlated by `index`, and the numbering is the same whichever `apiType` is in use.
-`generateStream` supports only `string` - a partial generation is a valid value only for `string`,
-so any other expected type returns an error; use `generate` for structured output.
+and tool-call fragments directly on the chunk - `content`, `reasoning` and `toolCalls` - and the
+last one carries the `finishReason`. Tool-call fragments are correlated by `index`, and the
+numbering is the same whichever `apiType` is in use. Token usage is not carried on the chunk; it is
+reported to the observability span. `generateStream` supports only `string` - a partial generation
+is a valid value only for `string`, so any other expected type returns an error; use `generate` for
+structured output.
 
 ## Issues and projects
 

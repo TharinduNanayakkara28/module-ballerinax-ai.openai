@@ -66,8 +66,9 @@ check from string fragment in fragments
     };
 ```
 
-Each `ai:ChatCompletionChunk` from `chatStream` carries text, reasoning and tool-call fragments,
-and the last one carries the finish reason and the token usage. Tool-call fragments are correlated
-by `index`, numbered the same way whichever `apiType` is in use. `generateStream` supports only
-`string`, since a partial generation is a valid value only for `string`; use `generate` for
-structured output.
+Each `ai:ChatCompletionChunk` from `chatStream` carries text, reasoning and tool-call fragments
+directly on the chunk - `content`, `reasoning` and `toolCalls` - and the last one carries the
+`finishReason`. Tool-call fragments are correlated by `index`, numbered the same way whichever
+`apiType` is in use. Token usage is not carried on the chunk; it is reported to the observability
+span. `generateStream` supports only `string`, since a partial generation is a valid value only
+for `string`; use `generate` for structured output.
