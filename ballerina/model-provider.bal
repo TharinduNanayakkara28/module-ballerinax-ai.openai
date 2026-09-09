@@ -378,7 +378,7 @@ public isolated distinct client class ModelProvider {
         if reasoningEffort is ReasoningEffort && supportsReasoning(self.modelType) {
             // Ask for a reasoning summary so the reasoning_summary_text.delta events stream;
             // without it the model's thinking is not surfaced. Only the streaming path asks:
-            // `ai:ChatCompletionChunkDelta` has a `reasoning` field to carry the fragments,
+            // `ai:ChatCompletionChunk` has a `reasoning` field to carry the fragments,
             // whereas `ai:ChatAssistantMessage` - what `chat()` returns - has nowhere to put a
             // summary, so requesting one there would only pay for output nobody can read.
             request.reasoning = {effort: reasoningEffort, summary: "auto"};
@@ -1009,6 +1009,8 @@ isolated function extractHttpErrorDetail(http:Response response) returns string?
 # normalized `ai:ChatCompletionChunk` values. Each `data:` line is parsed into the
 # OpenAI wire chunk and mapped via `toAiChunk`; the terminating `[DONE]` sentinel and
 # blank lines end or are skipped, and the chat span is closed once the stream is done.
+# Token usage is read off the wire chunk and reported to the span; the trailing
+# usage-only chunk therefore maps to nothing and is skipped.
 #
 # A frame that cannot be parsed is reported as an error rather than skipped: OpenAI emits
 # `{"error": {...}}` mid-stream when a generation is cut short, and skipping it would end
@@ -1060,7 +1062,14 @@ class OpenAiChunkIterator {
                 return self.failStream(error ai:LlmInvalidResponseError(
                         "Unexpected chunk shape received from the model", wireChunk));
             }
-            ai:ChatCompletionChunk chunk = toAiChunk(wireChunk);
+            // Usage rides the wire chunk rather than the normalized one, so it is
+            // reported to the span before the chunk is projected.
+            self.recordUsage(wireChunk.usage);
+            ai:ChatCompletionChunk? chunk = toAiChunk(wireChunk);
+            if chunk is () {
+                // Usage-only chunk: nothing left to surface to the caller.
+                continue;
+            }
             self.recordChunk(chunk);
             return {value: chunk};
         }
@@ -1077,26 +1086,21 @@ class OpenAiChunkIterator {
         return ();
     }
 
-    // Records the finish reason and usage the span reports for the completed generation.
+    // Records the finish reason the span reports for the completed generation.
     private isolated function recordChunk(ai:ChatCompletionChunk chunk) {
-        ai:ChatCompletionChunkChoice[] choices = chunk.choices;
-        if choices.length() > 0 {
-            ai:FinishReason? finishReason = choices[0].finishReason;
-            if finishReason is ai:FinishReason {
-                self.span.addFinishReason(finishReason);
-                self.span.addOutputType(observe:TEXT);
-            }
+        ai:FinishReason? finishReason = chunk.finishReason;
+        if finishReason is ai:FinishReason {
+            self.span.addFinishReason(finishReason);
+            self.span.addOutputType(observe:TEXT);
         }
-        ai:CompletionTokenUsage? usage = chunk?.usage;
-        if usage is ai:CompletionTokenUsage {
-            int? promptTokens = usage?.promptTokens;
-            if promptTokens is int {
-                self.span.addInputTokenCount(promptTokens);
-            }
-            int? completionTokens = usage?.completionTokens;
-            if completionTokens is int {
-                self.span.addOutputTokenCount(completionTokens);
-            }
+    }
+
+    // Records the token counts the span reports, taken off the wire chunk since the
+    // normalized chunk no longer carries usage.
+    private isolated function recordUsage(CompletionUsage? usage) {
+        if usage is CompletionUsage {
+            self.span.addInputTokenCount(usage.prompt_tokens);
+            self.span.addOutputTokenCount(usage.completion_tokens);
         }
     }
 
@@ -1192,6 +1196,9 @@ class ResponsesChunkIterator {
             if ev.'type == "response.failed" {
                 return self.failStream(error ai:LlmError(responsesFailureMessage(ev)));
             }
+            // Usage rides the lifecycle event rather than the normalized chunk, so it
+            // is reported to the span before the event is projected.
+            self.recordUsage(responsesEventUsage(ev));
             ai:ChatCompletionChunk? chunk = responsesEventToChunk(ev, self.state);
             if chunk is ai:ChatCompletionChunk {
                 self.recordChunk(chunk);
@@ -1211,26 +1218,21 @@ class ResponsesChunkIterator {
         return ();
     }
 
-    // Records the finish reason and usage the span reports for the completed generation.
+    // Records the finish reason the span reports for the completed generation.
     private isolated function recordChunk(ai:ChatCompletionChunk chunk) {
-        ai:ChatCompletionChunkChoice[] choices = chunk.choices;
-        if choices.length() > 0 {
-            ai:FinishReason? finishReason = choices[0].finishReason;
-            if finishReason is ai:FinishReason {
-                self.span.addFinishReason(finishReason);
-                self.span.addOutputType(observe:TEXT);
-            }
+        ai:FinishReason? finishReason = chunk.finishReason;
+        if finishReason is ai:FinishReason {
+            self.span.addFinishReason(finishReason);
+            self.span.addOutputType(observe:TEXT);
         }
-        ai:CompletionTokenUsage? usage = chunk?.usage;
-        if usage is ai:CompletionTokenUsage {
-            int? promptTokens = usage?.promptTokens;
-            if promptTokens is int {
-                self.span.addInputTokenCount(promptTokens);
-            }
-            int? completionTokens = usage?.completionTokens;
-            if completionTokens is int {
-                self.span.addOutputTokenCount(completionTokens);
-            }
+    }
+
+    // Records the token counts the span reports, taken off the wire event since the
+    // normalized chunk no longer carries usage.
+    private isolated function recordUsage(ResponsesEventUsage? usage) {
+        if usage is ResponsesEventUsage {
+            self.span.addInputTokenCount(usage.input_tokens ?: 0);
+            self.span.addOutputTokenCount(usage.output_tokens ?: 0);
         }
     }
 
@@ -1288,8 +1290,8 @@ function generateLlmResponseStream(ModelProvider llmModel, ai:Prompt prompt, typ
 }
 
 # Projects a normalized `ai:ChatCompletionChunk` stream onto its text content,
-# yielding each non-empty `delta.content` fragment and skipping tool-call and
-# usage-only chunks. Backs `generateLlmResponseStream`.
+# yielding each non-empty `content` fragment and skipping chunks that carry none -
+# tool-call, reasoning and finish-reason-only chunks. Backs `generateLlmResponseStream`.
 class ChunkTextIterator {
     private stream<ai:ChatCompletionChunk, ai:Error?> chunks;
 
@@ -1306,11 +1308,7 @@ class ChunkTextIterator {
             if next is ai:Error {
                 return next;
             }
-            ai:ChatCompletionChunkChoice[] choices = next.value.choices;
-            if choices.length() == 0 {
-                continue;
-            }
-            string? content = choices[0].delta.content;
+            string? content = next.value.content;
             if content is string && content.length() > 0 {
                 return {value: content};
             }

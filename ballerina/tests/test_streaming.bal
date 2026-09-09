@@ -45,11 +45,9 @@ isolated function collectChunks(stream<ai:ChatCompletionChunk, ai:Error?> chunks
 isolated function joinContent(ai:ChatCompletionChunk[] chunks) returns string {
     string text = "";
     foreach ai:ChatCompletionChunk chunk in chunks {
-        foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-            string? content = choice.delta.content;
-            if content is string {
-                text += content;
-            }
+        string? content = chunk.content;
+        if content is string {
+            text += content;
         }
     }
     return text;
@@ -59,11 +57,9 @@ isolated function joinContent(ai:ChatCompletionChunk[] chunks) returns string {
 isolated function joinReasoning(ai:ChatCompletionChunk[] chunks) returns string {
     string reasoning = "";
     foreach ai:ChatCompletionChunk chunk in chunks {
-        foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-            string? fragment = choice.delta.reasoning;
-            if fragment is string {
-                reasoning += fragment;
-            }
+        string? fragment = chunk.reasoning;
+        if fragment is string {
+            reasoning += fragment;
         }
     }
     return reasoning;
@@ -74,21 +70,16 @@ isolated function joinReasoning(ai:ChatCompletionChunk[] chunks) returns string 
 isolated function accumulateToolCalls(ai:ChatCompletionChunk[] chunks) returns map<[string, string]> {
     map<[string, string]> accumulated = {};
     foreach ai:ChatCompletionChunk chunk in chunks {
-        foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-            ai:ToolCallChunk[]? toolCalls = choice.delta.toolCalls;
-            if toolCalls is () {
-                continue;
-            }
-            foreach ai:ToolCallChunk toolCall in toolCalls {
-                string key = toolCall.index.toString();
-                [string, string] entry = accumulated[key] ?: ["", ""];
-                ai:FunctionCallChunk? 'function = toolCall?.'function;
-                if 'function is ai:FunctionCallChunk {
-                    entry[0] += 'function?.name ?: "";
-                    entry[1] += 'function?.arguments ?: "";
-                }
-                accumulated[key] = entry;
-            }
+        ai:ToolCallChunk[]? toolCalls = chunk.toolCalls;
+        if toolCalls is () {
+            continue;
+        }
+        foreach ai:ToolCallChunk toolCall in toolCalls {
+            string key = toolCall.index.toString();
+            [string, string] entry = accumulated[key] ?: ["", ""];
+            entry[0] += toolCall?.name ?: "";
+            entry[1] += toolCall?.arguments ?: "";
+            accumulated[key] = entry;
         }
     }
     return accumulated;
@@ -98,26 +89,12 @@ isolated function accumulateToolCalls(ai:ChatCompletionChunk[] chunks) returns m
 isolated function finalFinishReason(ai:ChatCompletionChunk[] chunks) returns ai:FinishReason? {
     ai:FinishReason? finishReason = ();
     foreach ai:ChatCompletionChunk chunk in chunks {
-        foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-            ai:FinishReason? reason = choice.finishReason;
-            if reason is ai:FinishReason {
-                finishReason = reason;
-            }
+        ai:FinishReason? reason = chunk.finishReason;
+        if reason is ai:FinishReason {
+            finishReason = reason;
         }
     }
     return finishReason;
-}
-
-// Returns the usage of the last chunk that carries it.
-isolated function finalUsage(ai:ChatCompletionChunk[] chunks) returns ai:CompletionTokenUsage? {
-    ai:CompletionTokenUsage? usage = ();
-    foreach ai:ChatCompletionChunk chunk in chunks {
-        ai:CompletionTokenUsage? chunkUsage = chunk?.usage;
-        if chunkUsage is ai:CompletionTokenUsage {
-            usage = chunkUsage;
-        }
-    }
-    return usage;
 }
 
 // ===== Chat Completions streaming =====
@@ -130,7 +107,11 @@ function testChatStreamText() returns ai:Error? {
 
     test:assertEquals(joinContent(chunks), "Hello world");
     test:assertEquals(finalFinishReason(chunks), ai:STOP);
-    test:assertEquals(finalUsage(chunks), {promptTokens: 10, completionTokens: 5, totalTokens: 15});
+    // The fixture's trailing usage-only chunk carries no choice. It maps to nothing and is
+    // skipped rather than surfaced as a chunk whose every field is `()`; its token counts go
+    // to the observability span. Only the two content chunks and the finish-reason chunk
+    // reach the caller.
+    test:assertEquals(chunks.length(), 3);
 }
 
 @test:Config
@@ -141,8 +122,7 @@ function testChatStreamCarriesResponseMetadata() returns ai:Error? {
 
     test:assertTrue(chunks.length() > 0, "Expected at least one chunk");
     test:assertEquals(chunks[0].id, "chatcmpl-1");
-    test:assertEquals(chunks[0].model, "gpt-4-turbo");
-    test:assertEquals(chunks[0].choices[0].delta.role, ai:ASSISTANT);
+    test:assertEquals(chunks[0].role, ai:ASSISTANT);
 }
 
 @test:Config
@@ -237,7 +217,6 @@ function testResponsesChatStreamText() returns ai:Error? {
 
     test:assertEquals(joinContent(chunks), "Hello world");
     test:assertEquals(finalFinishReason(chunks), ai:STOP);
-    test:assertEquals(finalUsage(chunks), {promptTokens: 10, completionTokens: 5, totalTokens: 15});
 }
 
 @test:Config
