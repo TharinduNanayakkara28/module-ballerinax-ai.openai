@@ -46,6 +46,28 @@ service /sse on new http:Listener(8081) {
         ]);
     }
 
+    // A role-only opening delta, as OpenAI sends before the first content fragment. It
+    // carries nothing the normalized chunks can hold, so it must map to no chunk at all.
+    resource function post roleonly/chat/completions() returns stream<http:SseEvent, error?>|error {
+        return sseEvents([
+            chatChunk(string `{"role":"assistant"}`),
+            chatChunk(string `{"content":"Hi"}`),
+            chatChunkWithFinishReason("stop"),
+            "[DONE]"
+        ]);
+    }
+
+    // One wire chunk carrying a content fragment and a finish reason together, as some
+    // OpenAI-compatible gateways emit. One raw chunk, two normalized chunks.
+    resource function post combined/chat/completions() returns stream<http:SseEvent, error?>|error {
+        return sseEvents([
+            string `{"id":"chatcmpl-combined","object":"chat.completion.chunk","created":1,` +
+                string `"model":"gpt-4-turbo","choices":[{"index":0,` +
+                string `"delta":{"role":"assistant","content":"All done."},"finish_reason":"stop"}]}`,
+            "[DONE]"
+        ]);
+    }
+
     // Two tool calls streamed in fragments, ending with a `tool_calls` finish reason.
     resource function post tools/chat/completions() returns stream<http:SseEvent, error?>|error {
         return sseEvents([

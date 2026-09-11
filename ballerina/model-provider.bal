@@ -378,7 +378,7 @@ public isolated distinct client class ModelProvider {
         if reasoningEffort is ReasoningEffort && supportsReasoning(self.modelType) {
             // Ask for a reasoning summary so the reasoning_summary_text.delta events stream;
             // without it the model's thinking is not surfaced. Only the streaming path asks:
-            // `ai:ChatCompletionChunk` has a `reasoning` field to carry the fragments,
+            // `ai:ChatCompletionReasoningChunk` carries the fragments,
             // whereas `ai:ChatAssistantMessage` - what `chat()` returns - has nowhere to put a
             // summary, so requesting one there would only pay for output nobody can read.
             request.reasoning = {effort: reasoningEffort, summary: "auto"};
@@ -1007,10 +1007,13 @@ isolated function extractHttpErrorDetail(http:Response response) returns string?
 
 # Iterator that converts OpenAI's Server-Sent Event stream into a stream of
 # normalized `ai:ChatCompletionChunk` values. Each `data:` line is parsed into the
-# OpenAI wire chunk and mapped via `toAiChunk`; the terminating `[DONE]` sentinel and
+# OpenAI wire chunk and mapped via `toAiChunks`; the terminating `[DONE]` sentinel and
 # blank lines end or are skipped, and the chat span is closed once the stream is done.
-# Token usage is read off the wire chunk and reported to the span; the trailing
-# usage-only chunk therefore maps to nothing and is skipped.
+# Token usage is read off the wire chunk and reported to the span; the role-only opening
+# chunk and the trailing usage-only chunk therefore map to nothing and are skipped.
+#
+# One wire chunk can carry a content fragment and a finish reason together, which maps
+# onto two normalized chunks, so mapped chunks are buffered and handed out one per `next`.
 #
 # A frame that cannot be parsed is reported as an error rather than skipped: OpenAI emits
 # `{"error": {...}}` mid-stream when a generation is cut short, and skipping it would end
@@ -1019,6 +1022,10 @@ class OpenAiChunkIterator {
     private stream<http:SseEvent, error?> sseStream;
     private observe:ChatSpan span;
     private boolean done = false;
+    # Chunks mapped from the most recent SSE event but not yet handed to the caller.
+    # One wire chunk can fan out into several normalized chunks - each carries a single
+    # kind of update - and `next` yields one per call.
+    private ai:ChatCompletionChunk[] pending = [];
 
     isolated function init(stream<http:SseEvent, error?> sseStream, observe:ChatSpan span) {
         self.sseStream = sseStream;
@@ -1028,6 +1035,9 @@ class OpenAiChunkIterator {
     public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
         if self.isDone() {
             return ();
+        }
+        if self.pending.length() > 0 {
+            return {value: self.pending.shift()};
         }
         while true {
             record {|http:SseEvent value;|}|error? event = self.sseStream.next();
@@ -1062,16 +1072,17 @@ class OpenAiChunkIterator {
                 return self.failStream(error ai:LlmInvalidResponseError(
                         "Unexpected chunk shape received from the model", wireChunk));
             }
-            // Usage rides the wire chunk rather than the normalized one, so it is
+            // Usage rides the wire chunk rather than the normalized ones, so it is
             // reported to the span before the chunk is projected.
             self.recordUsage(wireChunk.usage);
-            ai:ChatCompletionChunk? chunk = toAiChunk(wireChunk);
-            if chunk is () {
-                // Usage-only chunk: nothing left to surface to the caller.
+            ai:ChatCompletionChunk[] chunks = toAiChunks(wireChunk);
+            if chunks.length() == 0 {
+                // Role-only or usage-only chunk: nothing left to surface to the caller.
                 continue;
             }
-            self.recordChunk(chunk);
-            return {value: chunk};
+            self.recordChunks(chunks);
+            self.pending = chunks;
+            return {value: self.pending.shift()};
         }
     }
 
@@ -1087,11 +1098,12 @@ class OpenAiChunkIterator {
     }
 
     // Records the finish reason the span reports for the completed generation.
-    private isolated function recordChunk(ai:ChatCompletionChunk chunk) {
-        ai:FinishReason? finishReason = chunk.finishReason;
-        if finishReason is ai:FinishReason {
-            self.span.addFinishReason(finishReason);
-            self.span.addOutputType(observe:TEXT);
+    private isolated function recordChunks(ai:ChatCompletionChunk[] chunks) {
+        foreach ai:ChatCompletionChunk chunk in chunks {
+            if chunk is ai:ChatCompletionStopChunk {
+                self.span.addFinishReason(chunk.finishReason);
+                self.span.addOutputType(observe:TEXT);
+            }
         }
     }
 
@@ -1137,10 +1149,11 @@ class OpenAiChunkIterator {
 }
 
 # Iterator that converts the Responses API SSE stream into a stream of normalized
-# `ai:ChatCompletionChunk` values. Text deltas, tool-call starts
+# `ai:ChatCompletionChunk` values. Text deltas, reasoning deltas, tool-call starts
 # (`response.output_item.added`) and argument fragments
-# (`response.function_call_arguments.delta`) are each mapped to a chunk;
-# lifecycle/other events are skipped, and the chat span is closed once the stream ends.
+# (`response.function_call_arguments.delta`) are each mapped to one chunk of the
+# matching kind; lifecycle/other events are skipped, and the chat span is closed once
+# the stream ends.
 #
 # As on the Chat Completions path, an unparseable frame is an error rather than a skip.
 # `error` events and `response.failed` end the stream with the failure the API reported,
@@ -1150,6 +1163,10 @@ class ResponsesChunkIterator {
     private observe:ChatSpan span;
     private ResponsesStreamState state = {};
     private boolean done = false;
+    # Chunks mapped from the most recent SSE event but not yet handed to the caller.
+    # The Responses API splits its updates across events, so this holds at most one
+    # today; the queue keeps the contract the same as on the Chat Completions path.
+    private ai:ChatCompletionChunk[] pending = [];
 
     isolated function init(stream<http:SseEvent, error?> sseStream, observe:ChatSpan span) {
         self.sseStream = sseStream;
@@ -1159,6 +1176,9 @@ class ResponsesChunkIterator {
     public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
         if self.isDone() {
             return ();
+        }
+        if self.pending.length() > 0 {
+            return {value: self.pending.shift()};
         }
         while true {
             record {|http:SseEvent value;|}|error? event = self.sseStream.next();
@@ -1196,14 +1216,16 @@ class ResponsesChunkIterator {
             if ev.'type == "response.failed" {
                 return self.failStream(error ai:LlmError(responsesFailureMessage(ev)));
             }
-            // Usage rides the lifecycle event rather than the normalized chunk, so it
+            // Usage rides the lifecycle event rather than the normalized chunks, so it
             // is reported to the span before the event is projected.
             self.recordUsage(responsesEventUsage(ev));
-            ai:ChatCompletionChunk? chunk = responsesEventToChunk(ev, self.state);
-            if chunk is ai:ChatCompletionChunk {
-                self.recordChunk(chunk);
-                return {value: chunk};
+            ai:ChatCompletionChunk[] chunks = responsesEventToChunks(ev, self.state);
+            if chunks.length() == 0 {
+                continue;
             }
+            self.recordChunks(chunks);
+            self.pending = chunks;
+            return {value: self.pending.shift()};
         }
     }
 
@@ -1219,11 +1241,12 @@ class ResponsesChunkIterator {
     }
 
     // Records the finish reason the span reports for the completed generation.
-    private isolated function recordChunk(ai:ChatCompletionChunk chunk) {
-        ai:FinishReason? finishReason = chunk.finishReason;
-        if finishReason is ai:FinishReason {
-            self.span.addFinishReason(finishReason);
-            self.span.addOutputType(observe:TEXT);
+    private isolated function recordChunks(ai:ChatCompletionChunk[] chunks) {
+        foreach ai:ChatCompletionChunk chunk in chunks {
+            if chunk is ai:ChatCompletionStopChunk {
+                self.span.addFinishReason(chunk.finishReason);
+                self.span.addOutputType(observe:TEXT);
+            }
         }
     }
 
@@ -1290,8 +1313,9 @@ function generateLlmResponseStream(ModelProvider llmModel, ai:Prompt prompt, typ
 }
 
 # Projects a normalized `ai:ChatCompletionChunk` stream onto its text content,
-# yielding each non-empty `content` fragment and skipping chunks that carry none -
-# tool-call, reasoning and finish-reason-only chunks. Backs `generateLlmResponseStream`.
+# yielding the fragment carried by each `ai:ChatCompletionTextChunk` and skipping
+# every other chunk kind - reasoning, tool call and stop. Backs
+# `generateLlmResponseStream`.
 class ChunkTextIterator {
     private stream<ai:ChatCompletionChunk, ai:Error?> chunks;
 
@@ -1308,10 +1332,11 @@ class ChunkTextIterator {
             if next is ai:Error {
                 return next;
             }
-            string? content = next.value.content;
-            if content is string && content.length() > 0 {
-                return {value: content};
+            ai:ChatCompletionChunk chunk = next.value;
+            if chunk is ai:ChatCompletionTextChunk && chunk.content.length() > 0 {
+                return {value: chunk.content};
             }
+            // Every other chunk kind carries no answer text; skip it.
         }
     }
 

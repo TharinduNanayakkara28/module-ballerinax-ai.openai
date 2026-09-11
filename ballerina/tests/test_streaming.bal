@@ -45,9 +45,8 @@ isolated function collectChunks(stream<ai:ChatCompletionChunk, ai:Error?> chunks
 isolated function joinContent(ai:ChatCompletionChunk[] chunks) returns string {
     string text = "";
     foreach ai:ChatCompletionChunk chunk in chunks {
-        string? content = chunk.content;
-        if content is string {
-            text += content;
+        if chunk is ai:ChatCompletionTextChunk {
+            text += chunk.content;
         }
     }
     return text;
@@ -57,9 +56,8 @@ isolated function joinContent(ai:ChatCompletionChunk[] chunks) returns string {
 isolated function joinReasoning(ai:ChatCompletionChunk[] chunks) returns string {
     string reasoning = "";
     foreach ai:ChatCompletionChunk chunk in chunks {
-        string? fragment = chunk.reasoning;
-        if fragment is string {
-            reasoning += fragment;
+        if chunk is ai:ChatCompletionReasoningChunk {
+            reasoning += chunk.reasoning;
         }
     }
     return reasoning;
@@ -70,31 +68,47 @@ isolated function joinReasoning(ai:ChatCompletionChunk[] chunks) returns string 
 isolated function accumulateToolCalls(ai:ChatCompletionChunk[] chunks) returns map<[string, string]> {
     map<[string, string]> accumulated = {};
     foreach ai:ChatCompletionChunk chunk in chunks {
-        ai:ToolCallChunk[]? toolCalls = chunk.toolCalls;
-        if toolCalls is () {
+        if chunk !is ai:ChatCompletionToolCallChunk {
             continue;
         }
-        foreach ai:ToolCallChunk toolCall in toolCalls {
-            string key = toolCall.index.toString();
+        foreach ai:ToolCallFragment fragment in chunk.toolCalls {
+            string key = fragment.index.toString();
             [string, string] entry = accumulated[key] ?: ["", ""];
-            entry[0] += toolCall?.name ?: "";
-            entry[1] += toolCall?.arguments ?: "";
+            entry[0] += fragment?.name ?: "";
+            entry[1] += fragment?.arguments ?: "";
             accumulated[key] = entry;
         }
     }
     return accumulated;
 }
 
-// Returns the finish reason of the last chunk that carries one.
+// Returns the finish reason of the last stop chunk in the sequence.
 isolated function finalFinishReason(ai:ChatCompletionChunk[] chunks) returns ai:FinishReason? {
     ai:FinishReason? finishReason = ();
     foreach ai:ChatCompletionChunk chunk in chunks {
-        ai:FinishReason? reason = chunk.finishReason;
-        if reason is ai:FinishReason {
-            finishReason = reason;
+        if chunk is ai:ChatCompletionStopChunk {
+            finishReason = chunk.finishReason;
         }
     }
     return finishReason;
+}
+
+// The kind of each chunk, in arrival order - a stronger assertion than field presence,
+// since it also catches chunks that should never have been emitted at all.
+isolated function chunkKinds(ai:ChatCompletionChunk[] chunks) returns string[] {
+    string[] kinds = [];
+    foreach ai:ChatCompletionChunk chunk in chunks {
+        if chunk is ai:ChatCompletionTextChunk {
+            kinds.push("text");
+        } else if chunk is ai:ChatCompletionReasoningChunk {
+            kinds.push("reasoning");
+        } else if chunk is ai:ChatCompletionToolCallChunk {
+            kinds.push("toolCall");
+        } else {
+            kinds.push("stop");
+        }
+    }
+    return kinds;
 }
 
 // ===== Chat Completions streaming =====
@@ -107,11 +121,11 @@ function testChatStreamText() returns ai:Error? {
 
     test:assertEquals(joinContent(chunks), "Hello world");
     test:assertEquals(finalFinishReason(chunks), ai:STOP);
-    // The fixture's trailing usage-only chunk carries no choice. It maps to nothing and is
-    // skipped rather than surfaced as a chunk whose every field is `()`; its token counts go
-    // to the observability span. Only the two content chunks and the finish-reason chunk
-    // reach the caller.
-    test:assertEquals(chunks.length(), 3);
+    // The opening delta carries `role` alongside its content, and `role` is no longer
+    // part of the contract - so it yields a text chunk only. The trailing usage-only
+    // chunk carries no choice at all and maps to nothing, its token counts going to the
+    // observability span instead. Asserting the kinds catches any spurious extra chunk.
+    test:assertEquals(chunkKinds(chunks), ["text", "text", "stop"]);
 }
 
 @test:Config
@@ -121,8 +135,34 @@ function testChatStreamCarriesResponseMetadata() returns ai:Error? {
     ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
 
     test:assertTrue(chunks.length() > 0, "Expected at least one chunk");
-    test:assertEquals(chunks[0].id, "chatcmpl-1");
-    test:assertEquals(chunks[0].role, ai:ASSISTANT);
+    test:assertEquals(chunks[0]?.id, "chatcmpl-1");
+}
+
+// A role-only opening delta carries nothing once `role` is gone, so it must map to no
+// chunk at all rather than to an empty one.
+@test:Config
+function testChatStreamSkipsRoleOnlyChunk() returns ai:Error? {
+    ModelProvider model = check chatStreamProvider("roleonly");
+    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check model->chatStream({role: ai:USER, content: "Say hello"});
+    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+
+    test:assertEquals(chunkKinds(chunks), ["text", "stop"]);
+    test:assertEquals(joinContent(chunks), "Hi");
+}
+
+// One wire chunk carrying a content fragment and a finish reason together must fan out
+// into two normalized chunks, in order, both stamped with the completion id.
+@test:Config
+function testChatStreamFansOutCombinedChunk() returns ai:Error? {
+    ModelProvider model = check chatStreamProvider("combined");
+    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check model->chatStream({role: ai:USER, content: "Say hello"});
+    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+
+    test:assertEquals(chunkKinds(chunks), ["text", "stop"]);
+    test:assertEquals(joinContent(chunks), "All done.");
+    test:assertEquals(finalFinishReason(chunks), ai:STOP);
+    test:assertEquals(chunks[0]?.id, "chatcmpl-combined");
+    test:assertEquals(chunks[1]?.id, "chatcmpl-combined");
 }
 
 @test:Config
@@ -226,7 +266,7 @@ function testResponsesChatStreamToolCallsUseDenseIndices() returns ai:Error? {
     ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
 
     // The stream opens with a reasoning item, so the tool calls arrive at `output_index` 1 and 2.
-    // `ai:ToolCallChunk.index` is a dense tool-call index, as the Chat Completions path produces,
+    // `ai:ToolCallFragment.index` is a dense tool-call index, as the Chat Completions path produces,
     // so a consumer keying an array by it sees the same numbering on both APIs.
     map<[string, string]> toolCalls = accumulateToolCalls(chunks);
     test:assertEquals(toolCalls.keys().sort(), ["0", "1"]);
