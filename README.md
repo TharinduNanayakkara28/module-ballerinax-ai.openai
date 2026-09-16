@@ -10,8 +10,8 @@ This module provides a generic API for connecting with OpenAI's LLM chat complet
 
 It talks to either of OpenAI's two APIs, chosen with the `apiType` initialization parameter:
 `CHAT_COMPLETIONS` (the default) or `RESPONSES`. Both support the same operations - `chat` and
-`generate` for a complete answer, and `chatStream` and `generateStream` to receive the answer as
-it is produced.
+`generate` for a complete answer, and `chatAsStream` and `generateAsStream` to receive the answer
+as it is produced.
 
 ```ballerina
 import ballerina/ai;
@@ -27,7 +27,7 @@ public function main() returns error? {
     string answer = check model->generate(`Explain Server-Sent Events in a sentence.`);
 
     // The same answer, a fragment at a time.
-    stream<string, ai:Error?> fragments = check model->generateStream(
+    stream<string, ai:Error?> fragments = check model->generateAsStream(
             `Explain Server-Sent Events in a sentence.`);
     check from string fragment in fragments
         do {
@@ -36,11 +36,11 @@ public function main() returns error? {
 }
 ```
 
-`chatStream` gives the raw chunks instead: each `ai:ChatCompletionChunk` carries text, reasoning
-and tool-call fragments, and the last one carries the finish reason and the token usage. Tool-call
-fragments are correlated by `index`, and the numbering is the same whichever `apiType` is in use.
-`generateStream` supports only `string` - a partial generation is a valid value only for `string`,
-so any other expected type returns an error; use `generate` for structured output.
+`chatAsStream` gives the raw chunks instead: each `ai:ChatMessageChunk` carries `role` (set on
+every chunk), a text or reasoning fragment, and/or tool-call fragments, with the finish reason
+set on the last one. Tool-call fragments are correlated by `index`, and the numbering is the same
+whichever `apiType` is in use. `generateAsStream` only ever streams text - a partial generation is
+a valid value only for `string`; use `generate` for structured output.
 
 ## Issues and projects
 

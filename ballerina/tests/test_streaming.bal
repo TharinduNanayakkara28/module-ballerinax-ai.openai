@@ -26,11 +26,11 @@ isolated function responsesStreamProvider(string scenario) returns ModelProvider
     new (API_KEY, GPT_4O, string `${STREAM_SERVICE_URL}/${scenario}`, apiType = RESPONSES);
 
 // Drains a chunk stream into a list, so a test can assert over the whole sequence.
-isolated function collectChunks(stream<ai:ChatCompletionChunk, ai:Error?> chunks)
-        returns ai:ChatCompletionChunk[]|ai:Error {
-    ai:ChatCompletionChunk[] collected = [];
+isolated function collectChunks(stream<ai:ChatMessageChunk, ai:Error?> chunks)
+        returns ai:ChatMessageChunk[]|ai:Error {
+    ai:ChatMessageChunk[] collected = [];
     while true {
-        record {|ai:ChatCompletionChunk value;|}|ai:Error? next = chunks.next();
+        record {|ai:ChatMessageChunk value;|}|ai:Error? next = chunks.next();
         if next is () {
             return collected;
         }
@@ -42,82 +42,59 @@ isolated function collectChunks(stream<ai:ChatCompletionChunk, ai:Error?> chunks
 }
 
 // Concatenates every text fragment in a chunk sequence.
-isolated function joinContent(ai:ChatCompletionChunk[] chunks) returns string {
+isolated function joinContent(ai:ChatMessageChunk[] chunks) returns string {
     string text = "";
-    foreach ai:ChatCompletionChunk chunk in chunks {
-        foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-            string? content = choice.delta.content;
-            if content is string {
-                text += content;
-            }
+    foreach ai:ChatMessageChunk chunk in chunks {
+        string? content = chunk.content;
+        if content is string {
+            text += content;
         }
     }
     return text;
 }
 
 // Concatenates every reasoning fragment in a chunk sequence.
-isolated function joinReasoning(ai:ChatCompletionChunk[] chunks) returns string {
+isolated function joinReasoning(ai:ChatMessageChunk[] chunks) returns string {
     string reasoning = "";
-    foreach ai:ChatCompletionChunk chunk in chunks {
-        foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-            string? fragment = choice.delta.reasoning;
-            if fragment is string {
-                reasoning += fragment;
-            }
+    foreach ai:ChatMessageChunk chunk in chunks {
+        string? fragment = chunk.reasoning;
+        if fragment is string {
+            reasoning += fragment;
         }
     }
     return reasoning;
 }
 
-// Accumulates streamed tool-call fragments the way a consumer of `ai:ChatCompletionChunk` is
+// Accumulates streamed tool-call fragments the way a consumer of `ai:ChatMessageChunk` is
 // expected to: keyed by `index`, with name and argument fragments joined in arrival order.
-isolated function accumulateToolCalls(ai:ChatCompletionChunk[] chunks) returns map<[string, string]> {
+isolated function accumulateToolCalls(ai:ChatMessageChunk[] chunks) returns map<[string, string]> {
     map<[string, string]> accumulated = {};
-    foreach ai:ChatCompletionChunk chunk in chunks {
-        foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-            ai:ToolCallChunk[]? toolCalls = choice.delta.toolCalls;
-            if toolCalls is () {
-                continue;
-            }
-            foreach ai:ToolCallChunk toolCall in toolCalls {
-                string key = toolCall.index.toString();
-                [string, string] entry = accumulated[key] ?: ["", ""];
-                ai:FunctionCallChunk? 'function = toolCall?.'function;
-                if 'function is ai:FunctionCallChunk {
-                    entry[0] += 'function?.name ?: "";
-                    entry[1] += 'function?.arguments ?: "";
-                }
-                accumulated[key] = entry;
-            }
+    foreach ai:ChatMessageChunk chunk in chunks {
+        ai:ToolCallChunk[]? toolCalls = chunk.toolCalls;
+        if toolCalls is () {
+            continue;
+        }
+        foreach ai:ToolCallChunk toolCall in toolCalls {
+            string key = toolCall.index.toString();
+            [string, string] entry = accumulated[key] ?: ["", ""];
+            entry[0] += toolCall?.name ?: "";
+            entry[1] += toolCall?.arguments ?: "";
+            accumulated[key] = entry;
         }
     }
     return accumulated;
 }
 
 // Returns the finish reason of the last chunk that carries one.
-isolated function finalFinishReason(ai:ChatCompletionChunk[] chunks) returns ai:FinishReason? {
+isolated function finalFinishReason(ai:ChatMessageChunk[] chunks) returns ai:FinishReason? {
     ai:FinishReason? finishReason = ();
-    foreach ai:ChatCompletionChunk chunk in chunks {
-        foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-            ai:FinishReason? reason = choice.finishReason;
-            if reason is ai:FinishReason {
-                finishReason = reason;
-            }
+    foreach ai:ChatMessageChunk chunk in chunks {
+        ai:FinishReason? reason = chunk.finishReason;
+        if reason is ai:FinishReason {
+            finishReason = reason;
         }
     }
     return finishReason;
-}
-
-// Returns the usage of the last chunk that carries it.
-isolated function finalUsage(ai:ChatCompletionChunk[] chunks) returns ai:CompletionTokenUsage? {
-    ai:CompletionTokenUsage? usage = ();
-    foreach ai:ChatCompletionChunk chunk in chunks {
-        ai:CompletionTokenUsage? chunkUsage = chunk?.usage;
-        if chunkUsage is ai:CompletionTokenUsage {
-            usage = chunkUsage;
-        }
-    }
-    return usage;
 }
 
 // ===== Chat Completions streaming =====
@@ -125,31 +102,31 @@ isolated function finalUsage(ai:ChatCompletionChunk[] chunks) returns ai:Complet
 @test:Config
 function testChatStreamText() returns ai:Error? {
     ModelProvider model = check chatStreamProvider("text");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check model->chatStream({role: ai:USER, content: "Say hello"});
-    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream = check model->chatAsStream({role: ai:USER, content: "Say hello"});
+    ai:ChatMessageChunk[] chunks = check collectChunks(chunkStream);
 
     test:assertEquals(joinContent(chunks), "Hello world");
     test:assertEquals(finalFinishReason(chunks), ai:STOP);
-    test:assertEquals(finalUsage(chunks), {promptTokens: 10, completionTokens: 5, totalTokens: 15});
 }
 
 @test:Config
-function testChatStreamCarriesResponseMetadata() returns ai:Error? {
+function testChatStreamCarriesResponseMetadataAndRoleOnEveryChunk() returns ai:Error? {
     ModelProvider model = check chatStreamProvider("text");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check model->chatStream({role: ai:USER, content: "Say hello"});
-    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream = check model->chatAsStream({role: ai:USER, content: "Say hello"});
+    ai:ChatMessageChunk[] chunks = check collectChunks(chunkStream);
 
     test:assertTrue(chunks.length() > 0, "Expected at least one chunk");
     test:assertEquals(chunks[0].id, "chatcmpl-1");
-    test:assertEquals(chunks[0].model, "gpt-4-turbo");
-    test:assertEquals(chunks[0].choices[0].delta.role, ai:ASSISTANT);
+    foreach ai:ChatMessageChunk chunk in chunks {
+        test:assertEquals(chunk.role, ai:ASSISTANT, "Expected 'role' to be set on every chunk");
+    }
 }
 
 @test:Config
 function testChatStreamToolCalls() returns ai:Error? {
     ModelProvider model = check chatStreamProvider("tools");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check model->chatStream({role: ai:USER, content: "Weather and time?"});
-    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream = check model->chatAsStream({role: ai:USER, content: "Weather and time?"});
+    ai:ChatMessageChunk[] chunks = check collectChunks(chunkStream);
 
     map<[string, string]> toolCalls = accumulateToolCalls(chunks);
     test:assertEquals(toolCalls["0"], ["getWeather", string `{"city":"Colombo"}`]);
@@ -160,8 +137,8 @@ function testChatStreamToolCalls() returns ai:Error? {
 @test:Config
 function testChatStreamReasoningFragments() returns ai:Error? {
     ModelProvider model = check chatStreamProvider("reasoning");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check model->chatStream({role: ai:USER, content: "What is 6 times 7?"});
-    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream = check model->chatAsStream({role: ai:USER, content: "What is 6 times 7?"});
+    ai:ChatMessageChunk[] chunks = check collectChunks(chunkStream);
 
     test:assertEquals(joinReasoning(chunks), "Let me think");
     test:assertEquals(joinContent(chunks), "42");
@@ -170,8 +147,8 @@ function testChatStreamReasoningFragments() returns ai:Error? {
 @test:Config
 function testChatStreamSurfacesMidStreamErrorFrame() returns error? {
     ModelProvider model = check chatStreamProvider("midstreamerror");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check model->chatStream({role: ai:USER, content: "Say hello"});
-    ai:ChatCompletionChunk[]|ai:Error result = collectChunks(chunkStream);
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream = check model->chatAsStream({role: ai:USER, content: "Say hello"});
+    ai:ChatMessageChunk[]|ai:Error result = collectChunks(chunkStream);
 
     // A generation cut short must not look like a clean, short answer.
     test:assertTrue(result is ai:Error, "Expected the mid-stream error frame to fail the stream");
@@ -183,8 +160,8 @@ function testChatStreamSurfacesMidStreamErrorFrame() returns error? {
 @test:Config
 function testChatStreamSurfacesMalformedFrame() returns error? {
     ModelProvider model = check chatStreamProvider("malformed");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check model->chatStream({role: ai:USER, content: "Say hello"});
-    ai:ChatCompletionChunk[]|ai:Error result = collectChunks(chunkStream);
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream = check model->chatAsStream({role: ai:USER, content: "Say hello"});
+    ai:ChatMessageChunk[]|ai:Error result = collectChunks(chunkStream);
 
     test:assertTrue(result is ai:Error, "Expected a malformed frame to fail the stream");
     test:assertTrue(result is ai:LlmInvalidResponseError,
@@ -194,8 +171,8 @@ function testChatStreamSurfacesMalformedFrame() returns error? {
 @test:Config
 function testChatStreamSurfacesHttpErrorStatus() returns error? {
     ModelProvider model = check chatStreamProvider("unauthorized");
-    stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error result =
-        model->chatStream({role: ai:USER, content: "Say hello"});
+    stream<ai:ChatMessageChunk, ai:Error?>|ai:Error result =
+        model->chatAsStream({role: ai:USER, content: "Say hello"});
 
     test:assertTrue(result is ai:Error, "Expected a 401 to fail before the stream opens");
     ai:Error err = <ai:Error>result;
@@ -206,9 +183,9 @@ function testChatStreamSurfacesHttpErrorStatus() returns error? {
 }
 
 @test:Config
-function testGenerateStreamProjectsTextFragments() returns error? {
+function testGenerateAsStreamProjectsTextFragments() returns error? {
     ModelProvider model = check chatStreamProvider("text");
-    stream<string, ai:Error?> fragments = check model->generateStream(`Say hello`);
+    stream<string, ai:Error?> fragments = check model->generateAsStream(`Say hello`);
     string text = "";
     check from string fragment in fragments
         do {
@@ -217,34 +194,23 @@ function testGenerateStreamProjectsTextFragments() returns error? {
     test:assertEquals(text, "Hello world");
 }
 
-@test:Config
-function testGenerateStreamRejectsNonStringTypes() returns error? {
-    ModelProvider model = check chatStreamProvider("text");
-    stream<int, ai:Error?>|ai:Error result = model->generateStream(`Rate this out of 10`);
-    test:assertTrue(result is ai:Error, "Only 'string' can be streamed");
-    ai:Error err = <ai:Error>result;
-    test:assertTrue(err.message().includes("supports only 'string'"),
-            string `Unexpected error message: ${err.message()}`);
-}
-
 // ===== Responses API streaming =====
 
 @test:Config
 function testResponsesChatStreamText() returns ai:Error? {
     ModelProvider model = check responsesStreamProvider("text");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check model->chatStream({role: ai:USER, content: "Say hello"});
-    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream = check model->chatAsStream({role: ai:USER, content: "Say hello"});
+    ai:ChatMessageChunk[] chunks = check collectChunks(chunkStream);
 
     test:assertEquals(joinContent(chunks), "Hello world");
     test:assertEquals(finalFinishReason(chunks), ai:STOP);
-    test:assertEquals(finalUsage(chunks), {promptTokens: 10, completionTokens: 5, totalTokens: 15});
 }
 
 @test:Config
 function testResponsesChatStreamToolCallsUseDenseIndices() returns ai:Error? {
     ModelProvider model = check responsesStreamProvider("tools");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check model->chatStream({role: ai:USER, content: "Weather and time?"});
-    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream = check model->chatAsStream({role: ai:USER, content: "Weather and time?"});
+    ai:ChatMessageChunk[] chunks = check collectChunks(chunkStream);
 
     // The stream opens with a reasoning item, so the tool calls arrive at `output_index` 1 and 2.
     // `ai:ToolCallChunk.index` is a dense tool-call index, as the Chat Completions path produces,
@@ -259,8 +225,8 @@ function testResponsesChatStreamToolCallsUseDenseIndices() returns ai:Error? {
 @test:Config
 function testResponsesChatStreamReportsToolCallsFinishReason() returns ai:Error? {
     ModelProvider model = check responsesStreamProvider("tools");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check model->chatStream({role: ai:USER, content: "Weather and time?"});
-    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream = check model->chatAsStream({role: ai:USER, content: "Weather and time?"});
+    ai:ChatMessageChunk[] chunks = check collectChunks(chunkStream);
 
     // The Responses API has no `tool_calls` finish reason of its own, but the normalized stream
     // must report one so a consumer can drive either API.
@@ -270,8 +236,8 @@ function testResponsesChatStreamReportsToolCallsFinishReason() returns ai:Error?
 @test:Config
 function testResponsesChatStreamSurfacesFailedResponse() returns error? {
     ModelProvider model = check responsesStreamProvider("failed");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check model->chatStream({role: ai:USER, content: "Say hello"});
-    ai:ChatCompletionChunk[]|ai:Error result = collectChunks(chunkStream);
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream = check model->chatAsStream({role: ai:USER, content: "Say hello"});
+    ai:ChatMessageChunk[]|ai:Error result = collectChunks(chunkStream);
 
     test:assertTrue(result is ai:Error, "A failed response must not look like a clean completion");
     ai:Error err = <ai:Error>result;
@@ -284,8 +250,8 @@ function testResponsesChatStreamSurfacesFailedResponse() returns error? {
 @test:Config
 function testResponsesChatStreamReportsTruncationAsLength() returns ai:Error? {
     ModelProvider model = check responsesStreamProvider("incomplete");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check model->chatStream({role: ai:USER, content: "Say hello"});
-    ai:ChatCompletionChunk[] chunks = check collectChunks(chunkStream);
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream = check model->chatAsStream({role: ai:USER, content: "Say hello"});
+    ai:ChatMessageChunk[] chunks = check collectChunks(chunkStream);
 
     test:assertEquals(joinContent(chunks), "Partial");
     test:assertEquals(finalFinishReason(chunks), ai:LENGTH);
@@ -294,8 +260,8 @@ function testResponsesChatStreamReportsTruncationAsLength() returns ai:Error? {
 @test:Config
 function testResponsesChatStreamSurfacesErrorEvent() returns error? {
     ModelProvider model = check responsesStreamProvider("errorevent");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = check model->chatStream({role: ai:USER, content: "Say hello"});
-    ai:ChatCompletionChunk[]|ai:Error result = collectChunks(chunkStream);
+    stream<ai:ChatMessageChunk, ai:Error?> chunkStream = check model->chatAsStream({role: ai:USER, content: "Say hello"});
+    ai:ChatMessageChunk[]|ai:Error result = collectChunks(chunkStream);
 
     test:assertTrue(result is ai:Error, "Expected the error event to fail the stream");
     ai:Error err = <ai:Error>result;
@@ -306,8 +272,8 @@ function testResponsesChatStreamSurfacesErrorEvent() returns error? {
 @test:Config
 function testResponsesChatStreamSurfacesHttpErrorStatus() returns error? {
     ModelProvider model = check responsesStreamProvider("unauthorized");
-    stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error result =
-        model->chatStream({role: ai:USER, content: "Say hello"});
+    stream<ai:ChatMessageChunk, ai:Error?>|ai:Error result =
+        model->chatAsStream({role: ai:USER, content: "Say hello"});
 
     test:assertTrue(result is ai:Error, "Expected a 401 to fail before the stream opens");
     ai:Error err = <ai:Error>result;
@@ -318,8 +284,8 @@ function testResponsesChatStreamSurfacesHttpErrorStatus() returns error? {
 @test:Config
 function testResponsesChatStreamRejectsStopSequence() returns error? {
     ModelProvider model = check responsesStreamProvider("text");
-    stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error result =
-        model->chatStream({role: ai:USER, content: "Say hello"}, stop = "STOP");
+    stream<ai:ChatMessageChunk, ai:Error?>|ai:Error result =
+        model->chatAsStream({role: ai:USER, content: "Say hello"}, stop = "STOP");
 
     test:assertTrue(result is ai:Error, "The Responses API has no stop-sequence parameter");
     ai:Error err = <ai:Error>result;
@@ -328,9 +294,9 @@ function testResponsesChatStreamRejectsStopSequence() returns error? {
 }
 
 @test:Config
-function testResponsesGenerateStreamProjectsTextFragments() returns error? {
+function testResponsesGenerateAsStreamProjectsTextFragments() returns error? {
     ModelProvider model = check responsesStreamProvider("text");
-    stream<string, ai:Error?> fragments = check model->generateStream(`Say hello`);
+    stream<string, ai:Error?> fragments = check model->generateAsStream(`Say hello`);
     string text = "";
     check from string fragment in fragments
         do {

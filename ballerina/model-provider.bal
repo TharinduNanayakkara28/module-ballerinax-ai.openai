@@ -254,12 +254,12 @@ public isolated distinct client class ModelProvider {
     # + messages - List of chat messages or a single user message
     # + tools - Tool definitions to be used for the tool call
     # + stop - Stop sequence to stop the completion
-    # + return - A stream of chat completion chunks, or an error in case of failures
-    isolated remote function chatStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
+    # + return - A stream of assistant message chunks, or an error in case of failures
+    isolated remote function chatAsStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
             ai:ChatCompletionFunctions[] tools = [], string? stop = ())
-            returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+            returns stream<ai:ChatMessageChunk, ai:Error?>|ai:Error {
         if self.apiType == RESPONSES {
-            return self.chatStreamViaResponses(messages, tools, stop);
+            return self.chatAsStreamViaResponses(messages, tools, stop);
         }
         http:Client? streamClient = self.streamClient;
         if streamClient is () {
@@ -312,15 +312,15 @@ public isolated distinct client class ModelProvider {
             span.close(sseStream);
             return sseStream;
         }
-        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new OpenAiChunkIterator(sseStream, span));
+        stream<ai:ChatMessageChunk, ai:Error?> chunkStream = new (new OpenAiChunkIterator(sseStream, span));
         return chunkStream;
     }
 
     // Streaming via the Responses API: builds the /responses request with stream:true,
-    // opens the SSE stream, and maps the Responses events onto ai:ChatCompletionChunk.
-    private isolated function chatStreamViaResponses(ai:ChatMessage[]|ai:ChatUserMessage messages,
+    // opens the SSE stream, and maps the Responses events onto ai:ChatMessageChunk.
+    private isolated function chatAsStreamViaResponses(ai:ChatMessage[]|ai:ChatUserMessage messages,
             ai:ChatCompletionFunctions[] tools, string? stop)
-            returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
+            returns stream<ai:ChatMessageChunk, ai:Error?>|ai:Error {
         http:Client? streamClient = self.streamClient;
         if streamClient is () {
             return error ai:Error("Streaming client is not initialized.");
@@ -378,9 +378,9 @@ public isolated distinct client class ModelProvider {
         if reasoningEffort is ReasoningEffort && supportsReasoning(self.modelType) {
             // Ask for a reasoning summary so the reasoning_summary_text.delta events stream;
             // without it the model's thinking is not surfaced. Only the streaming path asks:
-            // `ai:ChatCompletionChunkDelta` has a `reasoning` field to carry the fragments,
-            // whereas `ai:ChatAssistantMessage` - what `chat()` returns - has nowhere to put a
-            // summary, so requesting one there would only pay for output nobody can read.
+            // `ai:ChatMessageChunk` has a `reasoning` field to carry the fragments, whereas
+            // `ai:ChatAssistantMessage` - what `chat()` returns - has nowhere to put a summary,
+            // so requesting one there would only pay for output nobody can read.
             request.reasoning = {effort: reasoningEffort, summary: "auto"};
         }
 
@@ -389,7 +389,7 @@ public isolated distinct client class ModelProvider {
             span.close(sseStream);
             return sseStream;
         }
-        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new ResponsesChunkIterator(sseStream, span));
+        stream<ai:ChatMessageChunk, ai:Error?> chunkStream = new (new ResponsesChunkIterator(sseStream, span));
         return chunkStream;
     }
 
@@ -494,15 +494,14 @@ public isolated distinct client class ModelProvider {
     // ===== Chat Completions helper methods =====
 
     # Sends a streaming chat request to the model using the given prompt and streams
-    # back the generated answer. Only `string` is supported as the expected type.
+    # back the generated answer as text fragments.
     #
     # + prompt - The prompt to use in the chat request
-    # + td - The expected type of the streamed value; must be `string`
-    # + return - A stream of the generated value, or an error if the type is unsupported
-    remote function generateStream(ai:Prompt prompt, @display {label: "Expected type"} typedesc<anydata> td = <>)
-            returns stream<td, ai:Error?>|ai:Error = @java:Method {
-        'class: "io.ballerina.lib.ai.openai.StreamGenerator"
-    } external;
+    # + return - A stream of text fragments, or an error if generation fails
+    isolated remote function generateAsStream(ai:Prompt prompt) returns stream<string, ai:Error?>|ai:Error {
+        stream<ai:ChatMessageChunk, ai:Error?> chunks = check self->chatAsStream({role: ai:USER, content: prompt});
+        return new stream<string, ai:Error?>(new ChunkTextIterator(chunks));
+    }
 
     private isolated function prepareCompletionRequestMessages(ai:ChatMessage[]|ai:ChatUserMessage messages,
             ai:ChatCompletionFunctions[] tools) returns chat:ChatCompletionRequestMessage[]|ai:Error {
@@ -1006,7 +1005,7 @@ isolated function extractHttpErrorDetail(http:Response response) returns string?
 }
 
 # Iterator that converts OpenAI's Server-Sent Event stream into a stream of
-# normalized `ai:ChatCompletionChunk` values. Each `data:` line is parsed into the
+# normalized `ai:ChatMessageChunk` values. Each `data:` line is parsed into the
 # OpenAI wire chunk and mapped via `toAiChunk`; the terminating `[DONE]` sentinel and
 # blank lines end or are skipped, and the chat span is closed once the stream is done.
 #
@@ -1023,7 +1022,7 @@ class OpenAiChunkIterator {
         self.span = span;
     }
 
-    public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+    public isolated function next() returns record {|ai:ChatMessageChunk value;|}|ai:Error? {
         if self.isDone() {
             return ();
         }
@@ -1060,9 +1059,11 @@ class OpenAiChunkIterator {
                 return self.failStream(error ai:LlmInvalidResponseError(
                         "Unexpected chunk shape received from the model", wireChunk));
             }
-            ai:ChatCompletionChunk chunk = toAiChunk(wireChunk);
-            self.recordChunk(chunk);
-            return {value: chunk};
+            self.recordObservations(wireChunk);
+            ai:ChatMessageChunk? chunk = toAiChunk(wireChunk);
+            if chunk is ai:ChatMessageChunk {
+                return {value: chunk};
+            }
         }
     }
 
@@ -1077,26 +1078,21 @@ class OpenAiChunkIterator {
         return ();
     }
 
-    // Records the finish reason and usage the span reports for the completed generation.
-    private isolated function recordChunk(ai:ChatCompletionChunk chunk) {
-        ai:ChatCompletionChunkChoice[] choices = chunk.choices;
+    // Records the finish reason and usage the span reports for the completed generation,
+    // read from the raw wire chunk since `ai:ChatMessageChunk` carries neither.
+    private isolated function recordObservations(CreateChatCompletionStreamResponse wireChunk) {
+        ChatCompletionStreamChoice[] choices = wireChunk.choices;
         if choices.length() > 0 {
-            ai:FinishReason? finishReason = choices[0].finishReason;
+            ai:FinishReason? finishReason = mapFinishReason(choices[0].finish_reason);
             if finishReason is ai:FinishReason {
                 self.span.addFinishReason(finishReason);
                 self.span.addOutputType(observe:TEXT);
             }
         }
-        ai:CompletionTokenUsage? usage = chunk?.usage;
-        if usage is ai:CompletionTokenUsage {
-            int? promptTokens = usage?.promptTokens;
-            if promptTokens is int {
-                self.span.addInputTokenCount(promptTokens);
-            }
-            int? completionTokens = usage?.completionTokens;
-            if completionTokens is int {
-                self.span.addOutputTokenCount(completionTokens);
-            }
+        CompletionUsage? usage = wireChunk.usage;
+        if usage is CompletionUsage {
+            self.span.addInputTokenCount(usage.prompt_tokens);
+            self.span.addOutputTokenCount(usage.completion_tokens);
         }
     }
 
@@ -1133,7 +1129,7 @@ class OpenAiChunkIterator {
 }
 
 # Iterator that converts the Responses API SSE stream into a stream of normalized
-# `ai:ChatCompletionChunk` values. Text deltas, tool-call starts
+# `ai:ChatMessageChunk` values. Text deltas, tool-call starts
 # (`response.output_item.added`) and argument fragments
 # (`response.function_call_arguments.delta`) are each mapped to a chunk;
 # lifecycle/other events are skipped, and the chat span is closed once the stream ends.
@@ -1152,7 +1148,7 @@ class ResponsesChunkIterator {
         self.span = span;
     }
 
-    public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
+    public isolated function next() returns record {|ai:ChatMessageChunk value;|}|ai:Error? {
         if self.isDone() {
             return ();
         }
@@ -1192,9 +1188,9 @@ class ResponsesChunkIterator {
             if ev.'type == "response.failed" {
                 return self.failStream(error ai:LlmError(responsesFailureMessage(ev)));
             }
-            ai:ChatCompletionChunk? chunk = responsesEventToChunk(ev, self.state);
-            if chunk is ai:ChatCompletionChunk {
-                self.recordChunk(chunk);
+            ai:ChatMessageChunk? chunk = responsesEventToChunk(ev, self.state);
+            if chunk is ai:ChatMessageChunk {
+                self.recordObservations(chunk, ev);
                 return {value: chunk};
             }
         }
@@ -1211,25 +1207,20 @@ class ResponsesChunkIterator {
         return ();
     }
 
-    // Records the finish reason and usage the span reports for the completed generation.
-    private isolated function recordChunk(ai:ChatCompletionChunk chunk) {
-        ai:ChatCompletionChunkChoice[] choices = chunk.choices;
-        if choices.length() > 0 {
-            ai:FinishReason? finishReason = choices[0].finishReason;
-            if finishReason is ai:FinishReason {
-                self.span.addFinishReason(finishReason);
-                self.span.addOutputType(observe:TEXT);
-            }
+    // Records the finish reason (carried by the mapped chunk) and token usage (read off the
+    // raw event, since `ai:ChatMessageChunk` has no field for it) for the completed generation.
+    private isolated function recordObservations(ai:ChatMessageChunk chunk, ResponsesStreamEvent ev) {
+        ai:FinishReason? finishReason = chunk.finishReason;
+        if finishReason is ai:FinishReason {
+            self.span.addFinishReason(finishReason);
+            self.span.addOutputType(observe:TEXT);
         }
-        ai:CompletionTokenUsage? usage = chunk?.usage;
-        if usage is ai:CompletionTokenUsage {
-            int? promptTokens = usage?.promptTokens;
-            if promptTokens is int {
-                self.span.addInputTokenCount(promptTokens);
-            }
-            int? completionTokens = usage?.completionTokens;
-            if completionTokens is int {
-                self.span.addOutputTokenCount(completionTokens);
+        ResponsesEventResponse? response = ev.response;
+        if response is ResponsesEventResponse {
+            ResponsesEventUsage? usage = response.usage;
+            if usage is ResponsesEventUsage {
+                self.span.addInputTokenCount(usage.input_tokens ?: 0);
+                self.span.addOutputTokenCount(usage.output_tokens ?: 0);
             }
         }
     }
@@ -1266,51 +1257,26 @@ class ResponsesChunkIterator {
     }
 }
 
-# Builds the string stream behind the dependently-typed `generateStream`. The
-# native `StreamGenerator` shim trampolines here so the type gating stays in
-# Ballerina. Only `string` is supported; other types yield an error because a
-# partial generation is a valid value only for `string`. When valid, the
-# underlying `chatStream` chunks are projected onto their text fragments.
-#
-# + llmModel - The model provider whose `chatStream` supplies the chunks
-# + prompt - The prompt to send to the model
-# + td - The caller's expected type; must be `string`
-# + return - A stream of text fragments, or an error if the type is unsupported
-function generateLlmResponseStream(ModelProvider llmModel, ai:Prompt prompt, typedesc<anydata> td)
-        returns stream<string, ai:Error?>|ai:Error {
-    if td !is typedesc<string> {
-        return error ai:Error("This data type is not supported for streaming. " +
-            "'generateStream' supports only 'string'; use 'generate' for structured types.");
-    }
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks = check llmModel->chatStream({role: ai:USER, content: prompt});
-    stream<string, ai:Error?> textStream = new (new ChunkTextIterator(chunks));
-    return textStream;
-}
-
-# Projects a normalized `ai:ChatCompletionChunk` stream onto its text content,
-# yielding each non-empty `delta.content` fragment and skipping tool-call and
-# usage-only chunks. Backs `generateLlmResponseStream`.
+# Projects a normalized `ai:ChatMessageChunk` stream onto its answer text, yielding
+# each non-empty `content` fragment and skipping reasoning, tool-call and
+# finish-only chunks. Backs `generateAsStream`.
 class ChunkTextIterator {
-    private stream<ai:ChatCompletionChunk, ai:Error?> chunks;
+    private stream<ai:ChatMessageChunk, ai:Error?> chunks;
 
-    isolated function init(stream<ai:ChatCompletionChunk, ai:Error?> chunks) {
+    isolated function init(stream<ai:ChatMessageChunk, ai:Error?> chunks) {
         self.chunks = chunks;
     }
 
     public isolated function next() returns record {|string value;|}|ai:Error? {
         while true {
-            record {|ai:ChatCompletionChunk value;|}|ai:Error? next = self.chunks.next();
+            record {|ai:ChatMessageChunk value;|}|ai:Error? next = self.chunks.next();
             if next is () {
                 return ();
             }
             if next is ai:Error {
                 return next;
             }
-            ai:ChatCompletionChunkChoice[] choices = next.value.choices;
-            if choices.length() == 0 {
-                continue;
-            }
-            string? content = choices[0].delta.content;
+            string? content = next.value.content;
             if content is string && content.length() > 0 {
                 return {value: content};
             }

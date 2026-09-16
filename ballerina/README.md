@@ -55,19 +55,19 @@ chatMessages.push(response);
 
 ### Step 5: Stream the response
 
-To show the answer as it is produced rather than waiting for all of it, use `generateStream` for
-the generated text, or `chatStream` for the raw chunks:
+To show the answer as it is produced rather than waiting for all of it, use `generateAsStream` for
+the generated text, or `chatAsStream` for the raw chunks:
 
 ```ballerina
-stream<string, ai:Error?> fragments = check openAiModel->generateStream(`Tell me about Ballerina`);
+stream<string, ai:Error?> fragments = check openAiModel->generateAsStream(`Tell me about Ballerina`);
 check from string fragment in fragments
     do {
         io:print(fragment);
     };
 ```
 
-Each `ai:ChatCompletionChunk` from `chatStream` carries text, reasoning and tool-call fragments,
-and the last one carries the finish reason and the token usage. Tool-call fragments are correlated
-by `index`, numbered the same way whichever `apiType` is in use. `generateStream` supports only
-`string`, since a partial generation is a valid value only for `string`; use `generate` for
-structured output.
+Each `ai:ChatMessageChunk` from `chatAsStream` carries `role` (set on every chunk), a text or
+reasoning fragment, and/or tool-call fragments, with the finish reason set on the last one.
+Tool-call fragments are correlated by `index`, numbered the same way whichever `apiType` is in
+use. `generateAsStream` only ever streams text, since a partial generation is a valid value only
+for `string`; use `generate` for structured output.

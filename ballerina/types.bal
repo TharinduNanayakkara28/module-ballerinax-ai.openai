@@ -398,97 +398,64 @@ type PromptTokensDetails record {
 
 // ── Wire → normalized mapping ──────────────────────────────────────────────
 // Projects an OpenAI `chat.completion.chunk` (the wire types above) onto the
-// normalized `ai:ChatCompletionChunk` that `chatStream` must return. Only the
+// normalized `ai:ChatMessageChunk` that `chatAsStream` must return. Only the
 // subset the `ai` type can hold is mapped; everything else is ignored.
 
-# Maps an OpenAI wire chunk onto the normalized `ai:ChatCompletionChunk`.
+# Maps an OpenAI wire chunk onto the normalized `ai:ChatMessageChunk`.
 # Forwards tool calls on every chunk (not just the first), so argument fragments
-# stream through correctly.
+# stream through correctly. `role` is set on every returned chunk, as required
+# by `ai:ChatMessageChunk`.
 #
 # + w - The parsed OpenAI wire chunk
-# + return - The normalized chunk consumed by the `ai` module
-isolated function toAiChunk(CreateChatCompletionStreamResponse w) returns ai:ChatCompletionChunk {
-    ai:ChatCompletionChunkChoice[] choices = [];
-    foreach ChatCompletionStreamChoice c in w.choices {
-        ai:ChatCompletionChunkDelta delta = {content: c.delta.content};
-        ai:ROLE? role = mapRole(c.delta?.role);
-        if role is ai:ROLE {
-            delta.role = role;
-        }
-        string? reasoningFragment = c.delta.reasoning_content ?: c.delta.reasoning;
-        if reasoningFragment is string {
-            delta.reasoning = reasoningFragment;
-        }
-        ChatCompletionMessageToolCallChunk[]? wireToolCalls = c.delta?.tool_calls;
-        if wireToolCalls is ChatCompletionMessageToolCallChunk[] {
-            ai:ToolCallChunk[] toolCalls = [];
-            foreach ChatCompletionMessageToolCallChunk t in wireToolCalls {
-                ai:ToolCallChunk toolCall = {index: t.index};
-                string? id = t?.id;
-                if id is string {
-                    toolCall.id = id;
-                }
-                ChatCompletionMessageToolCallChunkFunction? fn = t?.'function;
-                if fn is ChatCompletionMessageToolCallChunkFunction {
-                    ai:FunctionCallChunk functionFragment = {};
-                    string? name = fn?.name;
-                    if name is string {
-                        functionFragment.name = name;
-                    }
-                    string? arguments = fn?.arguments;
-                    if arguments is string {
-                        functionFragment.arguments = arguments;
-                    }
-                    toolCall.'function = functionFragment;
-                }
-                toolCalls.push(toolCall);
+# + return - The normalized chunk consumed by the `ai` module, or `()` when the
+# chunk carries nothing for the caller (no choices, or a role-only opening delta)
+isolated function toAiChunk(CreateChatCompletionStreamResponse w) returns ai:ChatMessageChunk? {
+    if w.choices.length() == 0 {
+        return ();
+    }
+    ChatCompletionStreamChoice choice = w.choices[0];
+    ChatCompletionStreamResponseDelta delta = choice.delta;
+
+    string? content = delta.content is string && delta.content != "" ? delta.content : ();
+    string? reasoningFragment = delta.reasoning_content ?: delta.reasoning;
+
+    ai:ToolCallChunk[]? toolCalls = ();
+    ChatCompletionMessageToolCallChunk[]? wireToolCalls = delta?.tool_calls;
+    if wireToolCalls is ChatCompletionMessageToolCallChunk[] {
+        ai:ToolCallChunk[] calls = [];
+        foreach ChatCompletionMessageToolCallChunk t in wireToolCalls {
+            ai:ToolCallChunk toolCall = {index: t.index};
+            string? id = t?.id;
+            if id is string {
+                toolCall.id = id;
             }
-            delta.toolCalls = toolCalls;
+            ChatCompletionMessageToolCallChunkFunction? fn = t?.'function;
+            if fn is ChatCompletionMessageToolCallChunkFunction {
+                string? name = fn?.name;
+                if name is string {
+                    toolCall.name = name;
+                }
+                string? arguments = fn?.arguments;
+                if arguments is string {
+                    toolCall.arguments = arguments;
+                }
+            }
+            calls.push(toolCall);
         }
-        choices.push({index: c.index, delta, finishReason: mapFinishReason(c.finish_reason)});
+        toolCalls = calls;
     }
 
-    ai:ChatCompletionChunk chunk = {choices};
+    ai:FinishReason? finishReason = mapFinishReason(choice.finish_reason);
+    if content is () && reasoningFragment is () && toolCalls is () && finishReason is () {
+        return ();
+    }
+
+    ai:ChatMessageChunk chunk = {role: ai:ASSISTANT, content, reasoning: reasoningFragment, toolCalls, finishReason};
     string? id = w?.id;
     if id is string {
         chunk.id = id;
     }
-    string? model = w?.model;
-    if model is string {
-        chunk.model = model;
-    }
-    CompletionUsage? usage = w.usage;
-    if usage is CompletionUsage {
-        chunk.usage = {
-            promptTokens: usage.prompt_tokens,
-            completionTokens: usage.completion_tokens,
-            totalTokens: usage.total_tokens
-        };
-    }
     return chunk;
-}
-
-# Safely maps an OpenAI role string onto the `ai:ROLE` enum; returns `()` for
-# absent or unrecognized values rather than panicking on a cast.
-#
-# + role - The role string from the wire delta
-# + return - The mapped `ai:ROLE`, or `()` when absent/unrecognized
-isolated function mapRole(string? role) returns ai:ROLE? {
-    // Streamed response deltas only carry the "assistant" role; "system"/"user"
-    // are handled for completeness. ("function" is request-only and the `ai`
-    // enum member is not accessible here, so it is intentionally omitted.)
-    match role {
-        "system" => {
-            return ai:SYSTEM;
-        }
-        "user" => {
-            return ai:USER;
-        }
-        "assistant" => {
-            return ai:ASSISTANT;
-        }
-    }
-    return ();
 }
 
 # Safely maps an OpenAI finish reason onto the `ai:FinishReason` enum. The `ai`
@@ -516,7 +483,7 @@ isolated function mapFinishReason(FinishReason? finishReason) returns ai:FinishR
 // ── Responses API streaming event wire types ───────────────────────────────
 // A trimmed model of the Server-Sent Events emitted by the /responses endpoint
 // when `stream` is true. Open records, so unmodeled fields are ignored. Only the
-// subset needed to build `ai:ChatCompletionChunk` is captured. `ResponsesChunkIterator`
+// subset needed to build `ai:ChatMessageChunk` is captured. `ResponsesChunkIterator`
 // maps these onto the normalized chunk.
 // Reference: https://platform.openai.com/docs/api-reference/responses-streaming
 
@@ -594,27 +561,28 @@ type ResponsesStreamState record {|
     int toolCallCount = 0;
 |};
 
-# Maps a single Responses API stream event onto an `ai:ChatCompletionChunk`, or
+# Maps a single Responses API stream event onto an `ai:ChatMessageChunk`, or
 # `()` for lifecycle/other events that carry no answer content. Text deltas,
 # tool-call starts (`output_item.added`) and argument fragments
-# (`function_call_arguments.delta`) each map to one chunk.
+# (`function_call_arguments.delta`) each map to one chunk, with `role` set on
+# every one, as required by `ai:ChatMessageChunk`.
 #
 # + ev - The parsed Responses stream event
 # + state - Per-stream state, updated in place as tool calls are seen
 # + return - The normalized chunk, or `()` to skip the event
 isolated function responsesEventToChunk(ResponsesStreamEvent ev, ResponsesStreamState state)
-        returns ai:ChatCompletionChunk? {
+        returns ai:ChatMessageChunk? {
     match ev.'type {
         "response.output_text.delta" => {
             string? delta = ev.delta;
-            if delta is string {
-                return {choices: [{index: 0, delta: {content: delta}}]};
+            if delta is string && delta.length() > 0 {
+                return {role: ai:ASSISTANT, content: delta};
             }
         }
         "response.reasoning_text.delta"|"response.reasoning_summary_text.delta" => {
             string? delta = ev.delta;
-            if delta is string {
-                return {choices: [{index: 0, delta: {reasoning: delta}}]};
+            if delta is string && delta.length() > 0 {
+                return {role: ai:ASSISTANT, reasoning: delta};
             }
         }
         "response.output_item.added" => {
@@ -627,9 +595,9 @@ isolated function responsesEventToChunk(ResponsesStreamEvent ev, ResponsesStream
                 }
                 string? name = item.name;
                 if name is string {
-                    toolCall.'function = {name: name};
+                    toolCall.name = name;
                 }
-                return {choices: [{index: 0, delta: {toolCalls: [toolCall]}}]};
+                return {role: ai:ASSISTANT, toolCalls: [toolCall]};
             }
         }
         "response.function_call_arguments.delta" => {
@@ -637,9 +605,9 @@ isolated function responsesEventToChunk(ResponsesStreamEvent ev, ResponsesStream
             if delta is string {
                 ai:ToolCallChunk toolCall = {
                     index: nextToolCallIndex(ev.output_index, state),
-                    'function: {arguments: delta}
+                    arguments: delta
                 };
-                return {choices: [{index: 0, delta: {toolCalls: [toolCall]}}]};
+                return {role: ai:ASSISTANT, toolCalls: [toolCall]};
             }
         }
         "response.completed"|"response.incomplete" => {
@@ -674,8 +642,9 @@ isolated function nextToolCallIndex(int? outputIndex, ResponsesStreamState state
     return allocated;
 }
 
-# Builds the terminal `ai:ChatCompletionChunk` for a Responses lifecycle event,
-# carrying the finish reason and (when present) token usage.
+# Builds the terminal `ai:ChatMessageChunk` for a Responses lifecycle event, carrying
+# the finish reason. Token usage is read directly off the raw event by the iterator,
+# since `ai:ChatMessageChunk` has no field to carry it.
 #
 # The Responses API has no `tool_calls` finish reason of its own, so a completed
 # response that streamed at least one tool call is reported as `tool_calls` - matching
@@ -685,24 +654,12 @@ isolated function nextToolCallIndex(int? outputIndex, ResponsesStreamState state
 # + state - Per-stream state, read to decide between `stop` and `tool_calls`
 # + return - The final normalized chunk
 isolated function responsesFinalChunk(ResponsesStreamEvent ev, ResponsesStreamState state)
-        returns ai:ChatCompletionChunk {
+        returns ai:ChatMessageChunk {
     ai:FinishReason finishReason = state.toolCallCount > 0 ? ai:TOOL_CALLS : ai:STOP;
     if ev.'type == "response.incomplete" {
         finishReason = responsesIncompleteReason(ev);
     }
-    ai:ChatCompletionChunk chunk = {choices: [{index: 0, delta: {}, finishReason}]};
-    ResponsesEventResponse? response = ev.response;
-    if response is ResponsesEventResponse {
-        ResponsesEventUsage? usage = response.usage;
-        if usage is ResponsesEventUsage {
-            chunk.usage = {
-                promptTokens: usage.input_tokens ?: 0,
-                completionTokens: usage.output_tokens ?: 0,
-                totalTokens: usage.total_tokens ?: 0
-            };
-        }
-    }
-    return chunk;
+    return {role: ai:ASSISTANT, finishReason};
 }
 
 # Maps the `incomplete_details.reason` of a "response.incomplete" event onto the
